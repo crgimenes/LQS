@@ -29,4 +29,4 @@ reset_git_history.sh
 validate_signatures.sh
 LQS
 LQS-linux-amd64
-
+dist

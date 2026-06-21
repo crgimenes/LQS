@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -8,8 +9,9 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
-	"lqs/lua"
+	"github.com/crgimenes/filo"
 
 	_ "github.com/glebarez/go-sqlite"
 	_ "github.com/lib/pq"
@@ -19,9 +21,9 @@ import (
 type Config struct {
 	jsonOutput   bool   // Whether to output the result in JSON format
 	dbURL        string // Database connection string
-	luaScript    string // Lua script to execute the return values will be used as SQL parameters (if any)
-	sqlForLua    string // SQL query to pass its result to Lua (values accessible as arg[1], arg[2], ...)
-	sqlStatement string // Main SQL query to execute (can receive parameters from Lua and/or SQL query)
+	filoScript   string // Filo script to execute; its return value (a list) is used as SQL parameters (if any)
+	sqlForFilo   string // SQL query to pass its result to Filo (values accessible as (nth arg 0), (nth arg 1), ...)
+	sqlStatement string // Main SQL query to execute (can receive parameters from Filo and/or SQL query)
 }
 
 // parseFile reads the file content and extracts the parameters.
@@ -31,7 +33,7 @@ func parseFile(file []byte) Config {
 	fileStr := strings.ReplaceAll(string(file), "\r\n", "\n")
 	lines := strings.Split(fileStr, "\n")
 
-	luaBrokenLine := false
+	filoBrokenLine := false
 
 	for i, line := range lines {
 		line = strings.TrimSpace(line)
@@ -62,33 +64,33 @@ func parseFile(file []byte) Config {
 			continue
 		}
 
-		// Process Lua script parameter
-		if strings.HasPrefix(upperLine, "-- LUA:") {
-			part := strings.TrimSpace(strings.TrimPrefix(line, "-- LUA:"))
-			// Handle Lua script broken line
+		// Process Filo script parameter
+		if strings.HasPrefix(upperLine, "-- FILO:") {
+			part := strings.TrimSpace(strings.TrimPrefix(line, "-- FILO:"))
+			// Handle Filo script broken line
 			if strings.HasSuffix(line, "\\") {
-				luaBrokenLine = true
-				cfg.luaScript = strings.TrimSuffix(part, "\\") + "\n"
+				filoBrokenLine = true
+				cfg.filoScript = strings.TrimSuffix(part, "\\") + "\n"
 			} else {
-				cfg.luaScript = part
+				cfg.filoScript = part
 			}
 			continue
 		}
 
-		// Process new SQL parameter for Lua
+		// Process new SQL parameter for Filo
 		if strings.HasPrefix(upperLine, "-- SQL:") {
-			cfg.sqlForLua = strings.TrimSpace(strings.TrimPrefix(line, "-- SQL:"))
+			cfg.sqlForFilo = strings.TrimSpace(strings.TrimPrefix(line, "-- SQL:"))
 			continue
 		}
 
-		// Continue Lua script from previous line
-		if luaBrokenLine {
+		// Continue Filo script from previous line
+		if filoBrokenLine {
 			part := strings.TrimPrefix(line, "-- ")
-			cfg.luaScript += strings.TrimSuffix(part, "\\") + "\n"
+			cfg.filoScript += strings.TrimSuffix(part, "\\") + "\n"
 			if strings.HasSuffix(line, "\\") {
 				continue
 			}
-			luaBrokenLine = false
+			filoBrokenLine = false
 			continue
 		}
 
@@ -97,7 +99,7 @@ func parseFile(file []byte) Config {
 	}
 
 	cfg.sqlStatement = strings.TrimSpace(cfg.sqlStatement)
-	cfg.luaScript = strings.TrimSpace(cfg.luaScript)
+	cfg.filoScript = strings.TrimSpace(cfg.filoScript)
 	return cfg
 }
 
@@ -169,19 +171,78 @@ func executeSQLParamQuery(db *sql.DB, sqlStmt string) ([]any, error) {
 	return values, nil
 }
 
-// runLuaScript executes the Lua script and, if provided, sets the SQL query result (sqlParams)
-// as a global variable "arg" (accessible as arg[1], arg[2], ...).
-func runLuaScript(luaScript string, sqlParams []any) ([]any, error) {
-	l := lua.New()
-	defer l.Close()
-
-	l.SetGlobal("arg", sqlParams)
-
-	err := l.DoString(luaScript)
-	if err != nil {
-		return nil, fmt.Errorf("error executing Lua script: %v", err)
+// anyToValue converts a Go value (typically a SQL column value) into a Filo Value.
+func anyToValue(p any) filo.Value {
+	switch v := p.(type) {
+	case nil:
+		return filo.VString("")
+	case string:
+		return filo.VString(v)
+	case bool:
+		return filo.VBool(v)
+	case int:
+		return filo.VNum(float64(v))
+	case int64:
+		return filo.VNum(float64(v))
+	case float64:
+		return filo.VNum(v)
+	case []byte:
+		return filo.VString(string(v))
+	default:
+		return filo.VString(fmt.Sprintf("%v", v))
 	}
-	return l.GetReturnValues(), nil
+}
+
+// valueToAny converts a Filo Value back into a Go value usable as a SQL parameter.
+func valueToAny(v filo.Value) any {
+	switch v.Kind {
+	case filo.KNumber:
+		return v.Num
+	case filo.KBool:
+		return v.Bool
+	case filo.KString:
+		return v.Str
+	default:
+		return v.String()
+	}
+}
+
+// runFiloScript executes the Filo script and, if provided, exposes the SQL query
+// result (sqlParams) as the global "arg" (accessible as (nth arg 0), (nth arg 1), ...).
+// The script's final expression is its result: a (list ...) becomes the list of SQL
+// parameters, and any other single value becomes a single parameter.
+func runFiloScript(script string, sqlParams []any) ([]any, error) {
+	eng := filo.NewEngine()
+
+	argValues := make([]filo.Value, len(sqlParams))
+	for i, p := range sqlParams {
+		argValues[i] = anyToValue(p)
+	}
+
+	globals := map[string]filo.Value{
+		"arg": filo.VList(argValues),
+	}
+
+	cfg := filo.EvalConfig{
+		StepLimit:      100000,
+		RecursionLimit: 128,
+		Timeout:        5 * time.Second,
+	}
+
+	result, _, err := eng.RunScript(context.Background(), script, globals, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("error executing Filo script: %w", err)
+	}
+
+	if result.Kind == filo.KList {
+		out := make([]any, len(result.List))
+		for i, e := range result.List {
+			out[i] = valueToAny(e)
+		}
+		return out, nil
+	}
+
+	return []any{valueToAny(result)}, nil
 }
 
 func main() {
@@ -193,7 +254,7 @@ func main() {
 
 	// Flags to override parameters.
 	dbFlag := flag.String("db", "", "db connection string")
-	luaScriptFlag := flag.String("luaScript", "", "luaScript script")
+	filoScriptFlag := flag.String("filoScript", "", "Filo script")
 	flag.Parse()
 
 	if flag.NArg() > 0 {
@@ -215,8 +276,8 @@ func main() {
 	cfg := parseFile(file)
 
 	// Allow flags to override parameters.
-	if luaScriptFlag != nil && *luaScriptFlag != "" {
-		cfg.luaScript = *luaScriptFlag
+	if filoScriptFlag != nil && *filoScriptFlag != "" {
+		cfg.filoScript = *filoScriptFlag
 	}
 	if dbFlag != nil && *dbFlag != "" {
 		cfg.dbURL = *dbFlag
@@ -228,20 +289,20 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	// Exec the SQL query to get the parameters for the Lua script.
+	// Exec the SQL query to get the parameters for the Filo script.
 	var sqlParamValues []interface{}
-	if cfg.sqlForLua != "" {
-		sqlParamValues, err = executeSQLParamQuery(dbu, cfg.sqlForLua)
+	if cfg.sqlForFilo != "" {
+		sqlParamValues, err = executeSQLParamQuery(dbu, cfg.sqlForFilo)
 
 		if err != nil {
 			log.Fatalln(err)
 		}
 	}
 
-	// Exec the Lua script, if provided.
-	var luaReturnValues []interface{}
-	if cfg.luaScript != "" {
-		luaReturnValues, err = runLuaScript(cfg.luaScript, sqlParamValues)
+	// Exec the Filo script, if provided.
+	var filoReturnValues []interface{}
+	if cfg.filoScript != "" {
+		filoReturnValues, err = runFiloScript(cfg.filoScript, sqlParamValues)
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -249,8 +310,8 @@ func main() {
 
 	// Define the parameters to be used in the main SQL query.
 	param := sqlParamValues
-	if len(luaReturnValues) > 0 {
-		param = luaReturnValues
+	if len(filoReturnValues) > 0 {
+		param = filoReturnValues
 	}
 
 	// Exec the main SQL query.
