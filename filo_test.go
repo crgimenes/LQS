@@ -66,7 +66,7 @@ func TestEndToEndSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	params, err := runFiloScript(`(list 42 "Alice")`, nil)
 	if err != nil {
@@ -77,7 +77,7 @@ func TestEndToEndSQLite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	if !rows.Next() {
 		t.Fatal("no rows returned")

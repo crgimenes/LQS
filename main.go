@@ -14,7 +14,7 @@ import (
 	"github.com/crgimenes/filo"
 
 	_ "github.com/glebarez/go-sqlite"
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // Config holds the parameters extracted from the input file.
@@ -51,8 +51,8 @@ func parseFile(file []byte) Config {
 		// Process DB parameter
 		if strings.HasPrefix(upperLine, "-- DB:") {
 			cfg.dbURL = strings.TrimSpace(strings.TrimPrefix(line, "-- DB:"))
-			if strings.HasPrefix(cfg.dbURL, "$") {
-				cfg.dbURL = os.Getenv(strings.TrimPrefix(cfg.dbURL, "$"))
+			if after, ok := strings.CutPrefix(cfg.dbURL, "$"); ok {
+				cfg.dbURL = os.Getenv(after)
 			}
 			continue
 		}
@@ -105,15 +105,15 @@ func parseFile(file []byte) Config {
 
 // open establishes a connection with the database.
 func open(dbsource string) (db *sql.DB, err error) {
-	if strings.HasPrefix(dbsource, "sqlite://") {
-		dbsource = strings.TrimPrefix(dbsource, "sqlite://")
+	if after, ok := strings.CutPrefix(dbsource, "sqlite://"); ok {
+		dbsource = after
 		db, err = sql.Open("sqlite", dbsource)
 		if err != nil {
 			err = fmt.Errorf("error open db: %v, %v", dbsource, err)
 			return
 		}
 	} else if strings.HasPrefix(dbsource, "postgres://") {
-		db, err = sql.Open("postgres", dbsource)
+		db, err = sql.Open("pgx", dbsource)
 		if err != nil {
 			err = fmt.Errorf("error open db: %v, %v", dbsource, err)
 			return
@@ -131,7 +131,7 @@ func open(dbsource string) (db *sql.DB, err error) {
 }
 
 // query executes a SQL query with given parameters.
-func query(db *sql.DB, sqlStmt string, params ...interface{}) (rows *sql.Rows, err error) {
+func query(db *sql.DB, sqlStmt string, params ...any) (rows *sql.Rows, err error) {
 	rows, err = db.Query(sqlStmt, params...)
 	if err != nil {
 		err = fmt.Errorf("error query db: %v", err)
@@ -146,7 +146,7 @@ func executeSQLParamQuery(db *sql.DB, sqlStmt string) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	if !rows.Next() {
 		return nil, fmt.Errorf("no rows returned by SQL query: %v", sqlStmt)
@@ -157,8 +157,8 @@ func executeSQLParamQuery(db *sql.DB, sqlStmt string) ([]any, error) {
 		return nil, err
 	}
 
-	values := make([]interface{}, len(columns))
-	valuePtrs := make([]interface{}, len(columns))
+	values := make([]any, len(columns))
+	valuePtrs := make([]any, len(columns))
 	for i := range columns {
 		valuePtrs[i] = &values[i]
 	}
@@ -290,7 +290,7 @@ func main() {
 	}
 
 	// Exec the SQL query to get the parameters for the Filo script.
-	var sqlParamValues []interface{}
+	var sqlParamValues []any
 	if cfg.sqlForFilo != "" {
 		sqlParamValues, err = executeSQLParamQuery(dbu, cfg.sqlForFilo)
 
@@ -300,7 +300,7 @@ func main() {
 	}
 
 	// Exec the Filo script, if provided.
-	var filoReturnValues []interface{}
+	var filoReturnValues []any
 	if cfg.filoScript != "" {
 		filoReturnValues, err = runFiloScript(cfg.filoScript, sqlParamValues)
 		if err != nil {
@@ -330,18 +330,18 @@ func main() {
 
 	// Print the result in JSON format.
 	if cfg.jsonOutput {
-		a := make([]map[string]interface{}, 0)
+		a := make([]map[string]any, 0)
 		columns, err := rows.Columns()
 		if err != nil {
 			log.Fatalln(err)
 		}
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
 		for rows.Next() {
-			m := make(map[string]interface{})
+			m := make(map[string]any)
 			err = rows.Scan(valuePtrs...)
 			if err != nil {
 				log.Fatalln(err)
@@ -366,8 +366,8 @@ func main() {
 		if err != nil {
 			log.Fatalln(err)
 		}
-		values := make([]interface{}, len(columns))
-		valuePtrs := make([]interface{}, len(columns))
+		values := make([]any, len(columns))
+		valuePtrs := make([]any, len(columns))
 		for i := range columns {
 			valuePtrs[i] = &values[i]
 		}
