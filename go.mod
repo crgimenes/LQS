@@ -3,7 +3,7 @@ module lqs
 go 1.27.1
 
 require (
-	github.com/crgimenes/filo v0.0.21
+	github.com/crgimenes/filo v0.0.23
 	github.com/glebarez/go-sqlite v1.23.0
 	github.com/jackc/pgx/v5 v5.11.0
 )
