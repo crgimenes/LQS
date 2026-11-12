@@ -26,7 +26,7 @@ go.work.sum
 check_repo_info.sh
 reset_git_history.sh
 validate_signatures.sh
-LQS
-LQS-linux-amd64
+/LQS
+/LQS-linux-amd64
 dist
 release.sh

@@ -1,4 +1,4 @@
-module lqs
+module github.com/crgimenes/LQS
 
 go 1.27.1
 

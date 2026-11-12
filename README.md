@@ -28,6 +28,12 @@ lqs is a lightweight, cross-platform CLI tool written in Go for quickly testing 
 ## Installation
 
 ```bash
+go install github.com/crgimenes/LQS@latest   # installs the binary as LQS
+```
+
+or, from a clone:
+
+```bash
 go build -o lqs
 cp lqs /usr/local/bin   # or any directory in your PATH
 ```
@@ -42,6 +48,8 @@ With `-` or no file, the SQL is read from stdin. `-db` and `-filoScript` overrid
 `-- DB:` and `-- FILO:` comments; `-json` is the same as `-- JSON: TRUE`. `lqs -h` prints
 the full usage. Errors go to stderr with a non-zero exit status, and passwords in database
 URLs are masked.
+
+An agent skill lives in [skills/lqs/SKILL.md](skills/lqs/SKILL.md).
 
 ## Usage
 
