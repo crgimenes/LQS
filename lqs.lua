@@ -7,7 +7,7 @@ local function run_lqs()
   local start_line, start_col = start_pos[2], start_pos[3]
   local end_line, end_col     = end_pos[2], end_pos[3]
 
-  -- Enshure that start is really the beginning of the selection
+  -- Ensure that start is really the beginning of the selection
   if start_line > end_line or (start_line == end_line and start_col > end_col) then
     start_line, start_col, end_line, end_col = end_line, end_col, start_line, start_col
   end
@@ -35,21 +35,8 @@ local function run_lqs()
     return
   end
 
-  -- Create a temporary file to store the SQL script
-  local tmpfile = vim.fn.tempname() .. ".sql"
-  local f = io.open(tmpfile, "w")
-  if not f then
-    vim.notify("Cannot create temporary file", vim.log.levels.ERROR)
-    return
-  end
-  f:write(script)
-  f:close()
-
-  -- Exec the command lqs passing the temporary file
-  -- the lqs command must be in the PATH
-  local cmd = "lqs " .. tmpfile
-  local output = vim.fn.system(cmd)
-  os.remove(tmpfile)
+  -- lqs must be in the PATH; it reads the script from stdin
+  local output = vim.fn.system({ "lqs", "-" }, script)
 
   if vim.v.shell_error ~= 0 then
     vim.notify("lqs error: " .. output, vim.log.levels.ERROR)

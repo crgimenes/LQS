@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"reflect"
+	"strings"
 	"testing"
 )
 
-// TestParseFileFilo verifies that the -- FILO: metadata tag (and the rest of the
-// embedded metadata) is parsed into the Config.
 func TestParseFileFilo(t *testing.T) {
 	input := []byte(`-- DB: sqlite://:memory:
 -- FILO: (list 42 "Alice" 1.99)
@@ -27,12 +28,51 @@ WHERE id = $1 AND user = $2 AND value < $3;`)
 	}
 }
 
+func TestParseFileDirectives(t *testing.T) {
+	input := []byte("\uFEFF#!/usr/bin/env lqs\r\n" +
+		"-- db: sqlite://x.db\r\n" +
+		"-- Json: true\r\n" +
+		"-- sql: SELECT 1\r\n" +
+		"-- FILO: (list \\\r\n" +
+		"--   (nth arg 0))\r\n" +
+		"-- a plain comment: kept\r\n" +
+		"SELECT $1;\r\n")
+
+	cfg := parseFile(input)
+
+	want := Config{
+		jsonOutput:   true,
+		dbURL:        "sqlite://x.db",
+		filoScript:   "(list \n  (nth arg 0))",
+		sqlForFilo:   "SELECT 1",
+		sqlStatement: "-- a plain comment: kept\nSELECT $1;",
+	}
+	if cfg != want {
+		t.Fatalf("got %+v\nwant %+v", cfg, want)
+	}
+}
+
+func TestRedactURL(t *testing.T) {
+	cases := map[string]string{
+		"postgres://u:secret@h/db": "postgres://u:xxxxx@h/db",
+		"sqlite://:memory:":        "sqlite://:memory:",
+		"postgres://u@h/db":        "postgres://u@h/db",
+	}
+	for in, want := range cases {
+		got := redactURL(in)
+		if got != want {
+			t.Errorf("redactURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestRunFiloScript covers the three result shapes: a literal parameter list,
 // parameters computed from the -- SQL: result (exposed as arg), and a single
 // non-list value treated as one parameter.
 func TestRunFiloScript(t *testing.T) {
-	// 1) literal list of parameters
-	got, err := runFiloScript(`(list 42 "Alice" 1.99)`, nil)
+	ctx := context.Background()
+
+	got, err := runFiloScript(ctx, `(list 42 "Alice" 1.99)`, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -40,8 +80,7 @@ func TestRunFiloScript(t *testing.T) {
 		t.Fatalf("case 1: got %#v, want %#v", got, want)
 	}
 
-	// 2) parameters computed from arg (the -- SQL: result); nth is 0-based
-	got, err = runFiloScript(`(list (+ (nth arg 0) 1) (nth arg 1))`, []any{int64(10), "Bob"})
+	got, err = runFiloScript(ctx, `(list (+ (nth arg 0) 1) (nth arg 1))`, []any{int64(10), "Bob"})
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -49,8 +88,7 @@ func TestRunFiloScript(t *testing.T) {
 		t.Fatalf("case 2: got %#v, want %#v", got, want)
 	}
 
-	// 3) a single non-list value becomes a single parameter
-	got, err = runFiloScript(`(+ 2 40)`, nil)
+	got, err = runFiloScript(ctx, `(+ 2 40)`, nil)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -59,35 +97,48 @@ func TestRunFiloScript(t *testing.T) {
 	}
 }
 
-// TestEndToEndSQLite proves that Filo-produced parameters flow through into a real
-// query against an in-memory SQLite database.
-func TestEndToEndSQLite(t *testing.T) {
-	db, err := open("sqlite://:memory:")
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer func() { _ = db.Close() }()
+func TestRunSQLite(t *testing.T) {
+	cfg := parseFile([]byte(`-- DB: sqlite://:memory:
+-- SQL: SELECT 10, 'Bob'
+-- FILO: (list (+ (nth arg 0) 32) (nth arg 1))
+SELECT ? AS id, ? AS name`))
 
-	params, err := runFiloScript(`(list 42 "Alice")`, nil)
+	var out bytes.Buffer
+	err := run(context.Background(), cfg, &out)
 	if err != nil {
-		t.Fatalf("runFiloScript: %v", err)
+		t.Fatalf("run: %v", err)
+	}
+	want := "id: 42\nname: Bob\n"
+	if out.String() != want {
+		t.Fatalf("got %q, want %q", out.String(), want)
 	}
 
-	rows, err := query(db, "SELECT ? AS id, ? AS name", params...)
+	cfg.jsonOutput = true
+	out.Reset()
+	err = run(context.Background(), cfg, &out)
 	if err != nil {
-		t.Fatalf("query: %v", err)
+		t.Fatalf("run json: %v", err)
 	}
-	defer func() { _ = rows.Close() }()
+	if !strings.Contains(out.String(), `"name": "Bob"`) {
+		t.Fatalf("json output: %s", out.String())
+	}
+}
 
-	if !rows.Next() {
-		t.Fatal("no rows returned")
+func TestRunErrors(t *testing.T) {
+	t.Setenv("LQS_TEST_EMPTY", "")
+	cases := map[string]string{
+		"":                        "no database",
+		"$LQS_TEST_EMPTY":         "LQS_TEST_EMPTY is empty",
+		"mysql://u:secret@h/db":   "unknown database URL",
+		"postgres://u:secret@h:x": "unparsable",
 	}
-	var id float64
-	var name string
-	if err := rows.Scan(&id, &name); err != nil {
-		t.Fatalf("scan: %v", err)
-	}
-	if id != 42 || name != "Alice" {
-		t.Fatalf("got id=%v name=%q, want 42/Alice", id, name)
+	for db, want := range cases {
+		err := run(context.Background(), Config{dbURL: db, sqlStatement: "SELECT 1"}, &bytes.Buffer{})
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("db %q: err = %v, want %q", db, err, want)
+		}
+		if err != nil && strings.Contains(err.Error(), "secret") {
+			t.Errorf("db %q: password in error: %v", db, err)
+		}
 	}
 }

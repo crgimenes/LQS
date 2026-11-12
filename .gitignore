@@ -23,7 +23,6 @@ go.work.sum
 
 # env file
 .env
-release.sh
 check_repo_info.sh
 reset_git_history.sh
 validate_signatures.sh

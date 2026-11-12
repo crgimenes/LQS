@@ -20,7 +20,7 @@ lqs is a lightweight, cross-platform CLI tool written in Go for quickly testing 
   - PostgreSQL (`postgres://...`)
 
 - **No CGO Required**
-  All Go standard library features. Compiles on any Go-supported platform.
+  Pure Go SQLite and PostgreSQL drivers. Builds with `CGO_ENABLED=0` on any Go-supported platform.
 
 - **Neovim Integration**
   Easily test SQL within Neovim by sending the selected text to `lqs` in a temporary file. See [lqs.lua](lqs.lua) for a quick reference.
@@ -31,6 +31,17 @@ lqs is a lightweight, cross-platform CLI tool written in Go for quickly testing 
 go build -o lqs
 cp lqs /usr/local/bin   # or any directory in your PATH
 ```
+
+## Command line
+
+```
+lqs [-db URL] [-filoScript SCRIPT] [-json] [FILE | -]
+```
+
+With `-` or no file, the SQL is read from stdin. `-db` and `-filoScript` override the
+`-- DB:` and `-- FILO:` comments; `-json` is the same as `-- JSON: TRUE`. `lqs -h` prints
+the full usage. Errors go to stderr with a non-zero exit status, and passwords in database
+URLs are masked.
 
 ## Usage
 
@@ -74,11 +85,7 @@ cp lqs /usr/local/bin   # or any directory in your PATH
 
 ## Integration with Neovim
 
-A sample Lua function (`:LQS`) captures selected text, writes it to a temporary file, runs `lqs`, and displays the output. Place [lqs.lua](lqs.lua) in your Neovim config and create a user command like this:
-
-```lua
-vim.api.nvim_create_user_command("LQS", run_lqs, { range = true })
-```
+[lqs.lua](lqs.lua) defines `:LQS`: it sends the selected text to `lqs` on stdin and shows the output in a new buffer. Place it in your Neovim config (for example `~/.config/nvim/lua/lqs.lua`) and load it with `require "lqs"`.
 
 ## Contributing
 

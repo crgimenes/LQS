@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -17,20 +20,60 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// Config holds the parameters extracted from the input file.
+var GitTag = "dev"
+
+const usage = `Usage: lqs [-db URL] [-filoScript SCRIPT] [-json] [FILE | -]
+
+Runs the SQL in FILE (or stdin, with - or no argument) against the database
+named in its metadata comments, and prints the rows.
+
+Flags:
+  -db URL              database, overrides -- DB: (default: from the file)
+  -filoScript SCRIPT   Filo script, overrides -- FILO: (default: from the file)
+  -json                rows as a JSON array, same as -- JSON: TRUE
+
+Metadata comments in the SQL:
+  -- DB: sqlite://file.db | sqlite://:memory: | postgres://... | $ENV_VAR
+  -- SQL: SELECT ...     runs first; its row is arg in Filo, (nth arg 0) ...
+  -- FILO: (list ...)    result is bound to $1, $2, ... (end a line with \ to continue)
+  -- JSON: TRUE
+
+Output: one "column: value" line per column, records separated by
+"-=-=-=-= record N =-=-=-=-"; with -json, an array of objects.
+
+Example:
+  printf -- '-- DB: sqlite://:memory:\n-- FILO: (list 42)\nSELECT $1 AS n;\n' | lqs
+
+lqs %s
+`
+
 type Config struct {
-	jsonOutput   bool   // Whether to output the result in JSON format
-	dbURL        string // Database connection string
-	filoScript   string // Filo script to execute; its return value (a list) is used as SQL parameters (if any)
-	sqlForFilo   string // SQL query to pass its result to Filo (values accessible as (nth arg 0), (nth arg 1), ...)
-	sqlStatement string // Main SQL query to execute (can receive parameters from Filo and/or SQL query)
+	jsonOutput   bool
+	dbURL        string
+	filoScript   string
+	sqlForFilo   string
+	sqlStatement string
 }
 
-// parseFile reads the file content and extracts the parameters.
+// directive splits "-- KEY: value" into the upper-cased key and the value; an
+// unknown key is returned too, and the caller keeps that line as SQL.
+func directive(line string) (string, string) {
+	rest, ok := strings.CutPrefix(line, "-- ")
+	if !ok {
+		return "", ""
+	}
+	key, value, ok := strings.Cut(rest, ":")
+	if !ok {
+		return "", ""
+	}
+	return strings.ToUpper(key), strings.TrimSpace(value)
+}
+
 func parseFile(file []byte) Config {
 	cfg := Config{}
 
-	fileStr := strings.ReplaceAll(string(file), "\r\n", "\n")
+	fileStr := strings.TrimPrefix(string(file), "\uFEFF")
+	fileStr = strings.ReplaceAll(fileStr, "\r\n", "\n")
 	lines := strings.Split(fileStr, "\n")
 
 	filoBrokenLine := false
@@ -41,60 +84,37 @@ func parseFile(file []byte) Config {
 			continue
 		}
 
-		// Ignore shebang line
 		if i == 0 && strings.HasPrefix(line, "#!") {
 			continue
 		}
 
-		upperLine := strings.ToUpper(line)
-
-		// Process DB parameter
-		if strings.HasPrefix(upperLine, "-- DB:") {
-			cfg.dbURL = strings.TrimSpace(strings.TrimPrefix(line, "-- DB:"))
-			if after, ok := strings.CutPrefix(cfg.dbURL, "$"); ok {
-				cfg.dbURL = os.Getenv(after)
-			}
+		key, value := directive(line)
+		switch key {
+		case "DB":
+			cfg.dbURL = value
 			continue
-		}
-
-		// Process JSON output parameter
-		if strings.HasPrefix(upperLine, "-- JSON:") {
-			param := strings.TrimSpace(strings.TrimPrefix(line, "-- JSON:"))
-			cfg.jsonOutput = (strings.ToUpper(param) == "TRUE")
+		case "JSON":
+			cfg.jsonOutput = strings.EqualFold(value, "TRUE")
 			continue
-		}
-
-		// Process Filo script parameter
-		if strings.HasPrefix(upperLine, "-- FILO:") {
-			part := strings.TrimSpace(strings.TrimPrefix(line, "-- FILO:"))
-			// Handle Filo script broken line
-			if strings.HasSuffix(line, "\\") {
+		case "FILO":
+			cfg.filoScript = value
+			if strings.HasSuffix(value, "\\") {
 				filoBrokenLine = true
-				cfg.filoScript = strings.TrimSuffix(part, "\\") + "\n"
-			} else {
-				cfg.filoScript = part
+				cfg.filoScript = strings.TrimSuffix(value, "\\") + "\n"
 			}
 			continue
-		}
-
-		// Process new SQL parameter for Filo
-		if strings.HasPrefix(upperLine, "-- SQL:") {
-			cfg.sqlForFilo = strings.TrimSpace(strings.TrimPrefix(line, "-- SQL:"))
+		case "SQL":
+			cfg.sqlForFilo = value
 			continue
 		}
 
-		// Continue Filo script from previous line
 		if filoBrokenLine {
 			part := strings.TrimPrefix(line, "-- ")
 			cfg.filoScript += strings.TrimSuffix(part, "\\") + "\n"
-			if strings.HasSuffix(line, "\\") {
-				continue
-			}
-			filoBrokenLine = false
+			filoBrokenLine = strings.HasSuffix(line, "\\")
 			continue
 		}
 
-		// Non recognized line, consider it as SQL statement
 		cfg.sqlStatement += line + "\n"
 	}
 
@@ -103,75 +123,80 @@ func parseFile(file []byte) Config {
 	return cfg
 }
 
-// open establishes a connection with the database.
-func open(dbsource string) (db *sql.DB, err error) {
-	if after, ok := strings.CutPrefix(dbsource, "sqlite://"); ok {
-		dbsource = after
-		db, err = sql.Open("sqlite", dbsource)
-		if err != nil {
-			err = fmt.Errorf("error open db: %v, %v", dbsource, err)
-			return
-		}
-	} else if strings.HasPrefix(dbsource, "postgres://") {
-		db, err = sql.Open("pgx", dbsource)
-		if err != nil {
-			err = fmt.Errorf("error open db: %v, %v", dbsource, err)
-			return
-		}
-	} else {
-		err = fmt.Errorf("error open db: unknown db source %v", dbsource)
-		return
+// redactURL keeps passwords out of error messages, which end up in terminals
+// and editor notifications.
+func redactURL(s string) string {
+	if strings.HasPrefix(s, "sqlite://") {
+		return s
 	}
-
-	err = db.Ping()
+	u, err := url.Parse(s)
 	if err != nil {
-		log.Fatalln(err)
+		scheme, _, _ := strings.Cut(s, "://")
+		return scheme + "://(unparsable URL)"
 	}
-	return
+	return u.Redacted()
 }
 
-// query executes a SQL query with given parameters.
-func query(db *sql.DB, sqlStmt string, params ...any) (rows *sql.Rows, err error) {
-	rows, err = db.Query(sqlStmt, params...)
-	if err != nil {
-		err = fmt.Errorf("error query db: %v", err)
-		return
+func open(ctx context.Context, dbsource string) (*sql.DB, error) {
+	driver := ""
+	dsn := dbsource
+	switch {
+	case strings.HasPrefix(dbsource, "sqlite://"):
+		driver = "sqlite"
+		dsn = strings.TrimPrefix(dbsource, "sqlite://")
+	case strings.HasPrefix(dbsource, "postgres://"), strings.HasPrefix(dbsource, "postgresql://"):
+		driver = "pgx"
+	case dbsource == "":
+		return nil, errors.New("no database: add -- DB: to the file or use -db")
+	default:
+		return nil, fmt.Errorf("unknown database URL %q: use sqlite:// or postgres://", redactURL(dbsource))
 	}
-	return
+
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", redactURL(dbsource), err)
+	}
+	err = db.PingContext(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("connect %s: %w", redactURL(dbsource), err)
+	}
+	return db, nil
 }
 
-// executeSQLParamQuery executes the SQL query specified by -- SQL: and returns its single-row result.
-func executeSQLParamQuery(db *sql.DB, sqlStmt string) ([]any, error) {
-	rows, err := query(db, sqlStmt)
+func scanRow(rows *sql.Rows, n int) ([]any, error) {
+	values := make([]any, n)
+	ptrs := make([]any, n)
+	for i := range values {
+		ptrs[i] = &values[i]
+	}
+	err := rows.Scan(ptrs...)
+	return values, err
+}
+
+// executeSQLParamQuery runs the -- SQL: query and returns its first row.
+func executeSQLParamQuery(ctx context.Context, db *sql.DB, sqlStmt string) ([]any, error) {
+	rows, err := db.QueryContext(ctx, sqlStmt)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("-- SQL: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	if !rows.Next() {
-		return nil, fmt.Errorf("no rows returned by SQL query: %v", sqlStmt)
+		err = rows.Err()
+		if err != nil {
+			return nil, fmt.Errorf("-- SQL: %w", err)
+		}
+		return nil, fmt.Errorf("-- SQL: no rows returned by %v", sqlStmt)
 	}
 
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
 	}
-
-	values := make([]any, len(columns))
-	valuePtrs := make([]any, len(columns))
-	for i := range columns {
-		valuePtrs[i] = &values[i]
-	}
-
-	err = rows.Scan(valuePtrs...)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
+	return scanRow(rows, len(columns))
 }
 
-// anyToValue converts a Go value (typically a SQL column value) into a Filo Value.
 func anyToValue(p any) filo.Value {
 	switch v := p.(type) {
 	case nil:
@@ -193,7 +218,6 @@ func anyToValue(p any) filo.Value {
 	}
 }
 
-// valueToAny converts a Filo Value back into a Go value usable as a SQL parameter.
 func valueToAny(v filo.Value) any {
 	switch v.Kind {
 	case filo.KNumber:
@@ -207,11 +231,9 @@ func valueToAny(v filo.Value) any {
 	}
 }
 
-// runFiloScript executes the Filo script and, if provided, exposes the SQL query
-// result (sqlParams) as the global "arg" (accessible as (nth arg 0), (nth arg 1), ...).
-// The script's final expression is its result: a (list ...) becomes the list of SQL
-// parameters, and any other single value becomes a single parameter.
-func runFiloScript(script string, sqlParams []any) ([]any, error) {
+// runFiloScript exposes sqlParams to the script as the global "arg". A (list ...)
+// result becomes the SQL parameters; any other value becomes a single parameter.
+func runFiloScript(ctx context.Context, script string, sqlParams []any) ([]any, error) {
 	eng := filo.NewEngine()
 
 	argValues := make([]filo.Value, len(sqlParams))
@@ -229,158 +251,176 @@ func runFiloScript(script string, sqlParams []any) ([]any, error) {
 		Timeout:        5 * time.Second,
 	}
 
-	result, _, err := eng.RunScript(context.Background(), script, globals, cfg)
+	result, _, err := eng.RunScript(ctx, script, globals, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("error executing Filo script: %w", err)
+		return nil, fmt.Errorf("-- FILO: %w", err)
 	}
 
-	if result.Kind == filo.KList {
-		out := make([]any, len(result.List))
-		for i, e := range result.List {
-			out[i] = valueToAny(e)
+	if result.Kind != filo.KList {
+		return []any{valueToAny(result)}, nil
+	}
+	out := make([]any, len(result.List))
+	for i, e := range result.List {
+		out[i] = valueToAny(e)
+	}
+	return out, nil
+}
+
+func printJSON(w io.Writer, rows *sql.Rows, columns []string) error {
+	a := make([]map[string]any, 0)
+	for rows.Next() {
+		values, err := scanRow(rows, len(columns))
+		if err != nil {
+			return err
 		}
-		return out, nil
+		m := make(map[string]any, len(columns))
+		for i, col := range columns {
+			m[col] = values[i]
+		}
+		a = append(a, m)
+	}
+	err := rows.Err()
+	if err != nil {
+		return err
+	}
+	j, err := json.MarshalIndent(a, "", "    ")
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintln(w, string(j))
+	return err
+}
+
+func printText(w io.Writer, rows *sql.Rows, columns []string) error {
+	count := 0
+	for rows.Next() {
+		values, err := scanRow(rows, len(columns))
+		if err != nil {
+			return err
+		}
+		if count > 0 {
+			_, _ = fmt.Fprintf(w, "-=-=-=-= record %d =-=-=-=-\n", count)
+		}
+		for i, col := range columns {
+			_, _ = fmt.Fprintf(w, "%s: %v\n", col, values[i])
+		}
+		count++
+	}
+	return rows.Err()
+}
+
+func readInput(name string) ([]byte, error) {
+	if name != "" && name != "-" {
+		return os.ReadFile(name) // #nosec G304 -- the file to run is the user's argument
+	}
+	return io.ReadAll(os.Stdin)
+}
+
+func stdinIsTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func run(ctx context.Context, cfg Config, w io.Writer) error {
+	envVar, isEnv := strings.CutPrefix(cfg.dbURL, "$")
+	if isEnv {
+		cfg.dbURL = os.Getenv(envVar)
+	}
+	if isEnv && cfg.dbURL == "" {
+		return fmt.Errorf("-- DB: environment variable %s is empty", envVar)
 	}
 
-	return []any{valueToAny(result)}, nil
+	db, err := open(ctx, cfg.dbURL)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	var param []any
+	if cfg.sqlForFilo != "" {
+		param, err = executeSQLParamQuery(ctx, db, cfg.sqlForFilo)
+		if err != nil {
+			return err
+		}
+	}
+
+	if cfg.filoScript != "" {
+		var filoParams []any
+		filoParams, err = runFiloScript(ctx, cfg.filoScript, param)
+		if err != nil {
+			return err
+		}
+		if len(filoParams) > 0 {
+			param = filoParams
+		}
+	}
+
+	rows, err := db.QueryContext(ctx, cfg.sqlStatement, param...)
+	if err != nil {
+		return fmt.Errorf("query\ndb: %v\nSQL: %v\nerror: %w", redactURL(cfg.dbURL), cfg.sqlStatement, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	if cfg.jsonOutput {
+		return printJSON(w, rows, columns)
+	}
+	return printText(w, rows, columns)
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Llongfile)
+	fs := flag.NewFlagSet("lqs", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dbFlag := fs.String("db", "", "")
+	filoScriptFlag := fs.String("filoScript", "", "")
+	jsonFlag := fs.Bool("json", false, "")
 
-	var (
-		inputFlag = ""
-	)
-
-	// Flags to override parameters.
-	dbFlag := flag.String("db", "", "db connection string")
-	filoScriptFlag := flag.String("filoScript", "", "Filo script")
-	flag.Parse()
-
-	if flag.NArg() > 0 {
-		inputFlag = flag.Args()[0]
-	}
-
-	if inputFlag == "" {
-		fmt.Println("missing input file")
-		flag.Usage()
+	err := fs.Parse(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		fmt.Printf(usage, GitTag)
 		return
 	}
-
-	file, err := os.ReadFile(inputFlag)
 	if err != nil {
-		log.Fatalln(err)
+		fmt.Fprintf(os.Stderr, "lqs: %v\nRun lqs -h for usage.\n", err)
+		os.Exit(2)
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintln(os.Stderr, "lqs: one file at a time\nRun lqs -h for usage.")
+		os.Exit(2)
 	}
 
-	// Parse the file to extract parameters.
-	cfg := parseFile(file)
+	name := fs.Arg(0)
+	if name == "" && stdinIsTerminal() {
+		fmt.Fprintln(os.Stderr, "lqs: missing input file\nRun lqs -h for usage.")
+		os.Exit(2)
+	}
 
-	// Allow flags to override parameters.
-	if filoScriptFlag != nil && *filoScriptFlag != "" {
+	file, err := readInput(name)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lqs:", err)
+		os.Exit(1)
+	}
+
+	cfg := parseFile(file)
+	if *filoScriptFlag != "" {
 		cfg.filoScript = *filoScriptFlag
 	}
-	if dbFlag != nil && *dbFlag != "" {
+	if *dbFlag != "" {
 		cfg.dbURL = *dbFlag
 	}
+	cfg.jsonOutput = cfg.jsonOutput || *jsonFlag
 
-	// Open the database connection.
-	dbu, err := open(cfg.dbURL)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	err = run(ctx, cfg, os.Stdout)
+	stop()
 	if err != nil {
-		log.Fatalln(err)
-	}
-
-	// Exec the SQL query to get the parameters for the Filo script.
-	var sqlParamValues []any
-	if cfg.sqlForFilo != "" {
-		sqlParamValues, err = executeSQLParamQuery(dbu, cfg.sqlForFilo)
-
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-
-	// Exec the Filo script, if provided.
-	var filoReturnValues []any
-	if cfg.filoScript != "" {
-		filoReturnValues, err = runFiloScript(cfg.filoScript, sqlParamValues)
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}
-
-	// Define the parameters to be used in the main SQL query.
-	param := sqlParamValues
-	if len(filoReturnValues) > 0 {
-		param = filoReturnValues
-	}
-
-	// Exec the main SQL query.
-	cfg.sqlStatement = strings.TrimSpace(cfg.sqlStatement)
-	rows, err := query(dbu, cfg.sqlStatement, param...)
-	if err != nil {
-		err = fmt.Errorf("error query\ndb: %v\nSQL: %v\nerror: %v", cfg.dbURL, cfg.sqlStatement, err)
-		log.Fatalln(err)
-	}
-	defer func() {
-		err := rows.Close()
-		if err != nil {
-			log.Fatalln(err)
-		}
-	}()
-
-	// Print the result in JSON format.
-	if cfg.jsonOutput {
-		a := make([]map[string]any, 0)
-		columns, err := rows.Columns()
-		if err != nil {
-			log.Fatalln(err)
-		}
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range columns {
-			valuePtrs[i] = &values[i]
-		}
-		for rows.Next() {
-			m := make(map[string]any)
-			err = rows.Scan(valuePtrs...)
-			if err != nil {
-				log.Fatalln(err)
-			}
-			for i, col := range columns {
-				m[col] = values[i]
-			}
-			a = append(a, m)
-		}
-		j, err := json.MarshalIndent(a, "", "    ")
-		if err != nil {
-			log.Fatalln(err)
-		}
-		fmt.Println(string(j))
-		return
-	}
-
-	// Print the result in a human-readable format.
-	count := 0
-	for rows.Next() {
-		columns, err := rows.Columns()
-		if err != nil {
-			log.Fatalln(err)
-		}
-		values := make([]any, len(columns))
-		valuePtrs := make([]any, len(columns))
-		for i := range columns {
-			valuePtrs[i] = &values[i]
-		}
-		err = rows.Scan(valuePtrs...)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		if count > 0 {
-			fmt.Printf("-=-=-=-= record %d =-=-=-=-\n", count)
-		}
-		for i, col := range columns {
-			fmt.Printf("%s: %v\n", col, values[i])
-		}
-		count++
+		fmt.Fprintln(os.Stderr, "lqs:", err)
+		os.Exit(1)
 	}
 }
